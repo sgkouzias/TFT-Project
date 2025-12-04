@@ -5,9 +5,22 @@ from typing import List
 @keras.saving.register_keras_serializable()
 class QuantileLoss(keras.losses.Loss):
     """
-    Calculates Pinball Loss for probabilistic forecasting.
+    Calculates Pinball Loss (Quantile Loss) for probabilistic forecasting.
+    
+    The loss is calculated as:
+    L(y, y_pred) = max(q * (y - y_pred), (q - 1) * (y - y_pred))
+    averaged over all quantiles and samples.
+
+    Attributes:
+        quantiles (List[float]): List of quantiles to optimize for.
     """
     def __init__(self, quantiles: List[float], **kwargs):
+        """
+        Initialize the QuantileLoss.
+
+        Args:
+            quantiles (List[float]): List of quantiles (e.g., [0.1, 0.5, 0.9]).
+        """
         super().__init__(**kwargs)
         self.quantiles = quantiles
 

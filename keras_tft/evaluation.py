@@ -6,7 +6,7 @@ from typing import List, Optional, Union
 from .model import TFTForecaster
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-def timeseries_cv_with_covariates(
+def timeseries_cv(
     model: TFTForecaster, 
     df: pd.DataFrame, 
     num_windows: int,
@@ -14,21 +14,23 @@ def timeseries_cv_with_covariates(
     target_col: str = 'y',
     past_cov_cols: Optional[List[str]] = None,
     future_cov_cols: Optional[List[str]] = None,
+    static_cov_cols: Optional[List[str]] = None,
+    exogenous: Optional[List[str]] = None,
     epochs: int = 10,
     batch_size: int = 32,
     verbose: int = 0,
     scaler: Optional[Union[MinMaxScaler, StandardScaler]] = None
 ):
     """
-    Time series cross-validation with TFT and covariates.
+    Perform time series cross-validation with TFT and covariates.
     
-    Automatically detects covariates from the dataframe if not explicitly provided.
-    Handles different time frequencies by inferring from the dataframe index.
-    Prints detailed performance metrics (RMSE, MAE, MAPE).
+    This function automatically detects covariates from the dataframe if not explicitly provided,
+    handles different time frequencies by inferring from the dataframe index, and prints detailed 
+    performance metrics (RMSE, MAE, MAPE).
     
     The number of windows is fixed, and the start date is inferred to cover exactly
-    num_windows * forecast_horizon steps at the end of the dataset.
-    Stride is set equal to forecast_horizon (non-overlapping test sets).
+    `num_windows * forecast_horizon` steps at the end of the dataset.
+    Stride is set equal to `forecast_horizon` (non-overlapping test sets).
 
     Args:
         model (TFTForecaster): Initialized TFTForecaster model.
@@ -37,13 +39,16 @@ def timeseries_cv_with_covariates(
         num_windows (int): Number of cross-validation windows to perform.
         forecast_horizon (int, optional): Number of steps to forecast ahead. Defaults to 7.
         target_col (str, optional): Name of target column. Defaults to 'y'.
-        past_cov_cols (List[str], optional): List of past covariate columns.
+        past_cov_cols (List[str], optional): List of past covariate columns. Defaults to None.
         future_cov_cols (List[str], optional): List of future covariate columns. 
                                                If None, defaults to all non-target columns.
+        static_cov_cols (List[str], optional): List of static covariate columns. Defaults to None.
+        exogenous (List[str], optional): Alias for future_cov_cols. Defaults to None.
         epochs (int, optional): Number of training epochs per window. Defaults to 10.
         batch_size (int, optional): Batch size for training. Defaults to 32.
         verbose (int, optional): Verbosity mode. Defaults to 0.
-        scaler (Union[MinMaxScaler, StandardScaler], optional): Scaler used to scale the target column. If provided, metrics will be calculated on inverse transformed data.
+        scaler (Union[MinMaxScaler, StandardScaler], optional): Scaler used to scale the target column. 
+                                                                If provided, metrics will be calculated on inverse transformed data.
 
     Returns:
         pd.DataFrame: Results DataFrame containing 'id', 'timestamp', 'target_name', 'predictions'.
@@ -74,21 +79,26 @@ def timeseries_cv_with_covariates(
         else:
             raise ValueError("DataFrame must have a 'timestamp' column or a DatetimeIndex.")
             
+    # Handle Panel Data: Index might have duplicates (multiple series)
+    # We need unique timestamps to calculate windows
+    unique_timestamps = working_df.index.unique().sort_values()
+
     # Ensure dataframe has a frequency
     freq_name = "steps"
     if working_df.index.freq is None:
         try:
-            inferred_freq = pd.infer_freq(working_df.index)
+            inferred_freq = pd.infer_freq(unique_timestamps)
             if inferred_freq:
-                working_df = working_df.asfreq(inferred_freq)
+                # Do NOT use asfreq on working_df if it has duplicates (panel data)
+                # working_df = working_df.asfreq(inferred_freq) 
                 inferred_freq_upper = inferred_freq.upper()
                 if 'D' in inferred_freq_upper: freq_name = "days"
                 elif 'H' in inferred_freq_upper: freq_name = "hours"
                 elif 'M' in inferred_freq_upper: freq_name = "months"
                 elif 'W' in inferred_freq_upper: freq_name = "weeks"
             else:
-                # Fallback heuristic
-                diff = working_df.index.to_series().diff().mode()[0]
+                # Fallback heuristic using unique timestamps
+                diff = unique_timestamps.to_series().diff().mode()[0]
                 if diff >= pd.Timedelta(days=28): freq_name = "months"
                 elif diff >= pd.Timedelta(days=7): freq_name = "weeks"
                 elif diff >= pd.Timedelta(days=1): freq_name = "days"
@@ -115,6 +125,9 @@ def timeseries_cv_with_covariates(
             # Exclude id_column explicitly
             if col == 'id_column':
                 continue
+            # Exclude static cols
+            if col in (static_cov_cols or []):
+                continue
             # Check if numeric
             if pd.api.types.is_numeric_dtype(working_df[col]):
                 future_cov_cols.append(col)
@@ -124,42 +137,82 @@ def timeseries_cv_with_covariates(
 
     # Infer start date and stride
     stride = forecast_horizon
-    total_test_points = num_windows * forecast_horizon
     
-    if len(working_df) <= total_test_points + model.input_len:
-         # We need at least input_len history before the first test point
-        raise ValueError(f"Dataset length ({len(working_df)}) is too small for {num_windows} windows with horizon {forecast_horizon} and input length {model.input_len}.")
+    test_end_points = []
+    last_date = unique_timestamps[-1]
+    
+    # Infer frequency from unique timestamps if possible
+    freq = None
+    if working_df.index.freq:
+        freq = pd.tseries.frequencies.to_offset(working_df.index.freq)
+    else:
+        freq = pd.infer_freq(unique_timestamps)
+        if freq:
+            freq = pd.tseries.frequencies.to_offset(freq)
+    
+    for i in range(num_windows):
+        # Backwards from last_date
+        if freq:
+            end_dt = last_date - (freq * (stride * i))
+        else:
+             # Fallback: use integer position on UNIQUE timestamps
+             pos = len(unique_timestamps) - 1 - (stride * i)
+             if pos < 0: break
+             end_dt = unique_timestamps[pos]
+        test_end_points.append(end_dt)
         
-    start_idx = len(working_df) - total_test_points
-    start_date = working_df.index[start_idx]
-    end_date = working_df.index[-1]
+    test_end_points = sorted(test_end_points) # Chronological order
     
-    current_date = start_date
-    window = 0
-    
-    print(f"\n{'='*70}")
-    print(f"CROSS-VALIDATION: {start_date.date()} to {end_date.date()}")
-    print(f"Forecast Horizon: {forecast_horizon} {freq_name} | Windows: {num_windows}")
-    print(f"{'='*70}\n")
+    if len(test_end_points) < num_windows:
+         raise ValueError(f"Dataset too short for {num_windows} windows.")
+
+    # Check history for first window
+    first_test_end = test_end_points[0]
+    # Start of first test window
+    if freq:
+        first_test_start = first_test_end - (freq * (forecast_horizon - 1))
+    else:
+        # Heuristic on unique timestamps
+        try:
+            pos_end = unique_timestamps.get_loc(first_test_end)
+            pos_start = pos_end - forecast_horizon + 1
+            if pos_start < 0: raise ValueError("Dataset too short.")
+            first_test_start = unique_timestamps[pos_start]
+        except KeyError:
+             # Should not happen if logic is correct
+             raise ValueError(f"Could not locate start date for {first_test_end}")
+        
+    # We need input_len before first_test_start
+    # Check if we have enough data before first_test_start
+    # We check the earliest timestamp in the dataset
+    if unique_timestamps[0] > first_test_start: # This is rough check
+         # Better: check count of unique timestamps before first_test_start
+         train_len = len(unique_timestamps[unique_timestamps < first_test_start])
+         if train_len < model.input_len:
+             raise ValueError(f"Not enough history for first window. Need {model.input_len} steps, have {train_len}.")
+        
+
+
+    print(f"\n{'='*95}")
+    print(f"CROSS-VALIDATION: {test_end_points[0].date()} to {test_end_points[-1].date()} (Test Ends)")
+    print(f"Forecast Horizon: {forecast_horizon} {freq_name} | Windows: {len(test_end_points)}")
+    print(f"{'='*95}\n")
     
     id_column_name = 'series_1' # Dummy ID for result format
 
-    for i in range(num_windows):
-        window += 1
+    for i, test_end in enumerate(test_end_points):
+        window = i + 1
         
         # 1. Define Test Range
-        if working_df.index.freq:
-            test_end = current_date + (working_df.index.freq * (forecast_horizon - 1))
+        # test_end is already defined
+        
+        # Calculate current_date (start of test window)
+        if freq:
+            current_date = test_end - (freq * (forecast_horizon - 1))
         else:
-            # Fallback if no freq object but we have inferred unit? 
-            # Just use iloc logic if freq is missing to be safe?
-            # Let's try timedelta if possible
-            try:
-                test_end = current_date + pd.Timedelta(days=forecast_horizon - 1) # Defaulting to days if unknown
-            except:
-                 # Fallback to integer indexing if date math fails
-                 current_loc = working_df.index.get_loc(current_date)
-                 test_end = working_df.index[min(current_loc + forecast_horizon - 1, len(working_df)-1)]
+            pos_end = unique_timestamps.get_loc(test_end)
+            pos_start = pos_end - forecast_horizon + 1
+            current_date = unique_timestamps[pos_start]
 
         # 2. Prepare Data
         # Train: Up to current_date (exclusive)
@@ -189,6 +242,8 @@ def timeseries_cv_with_covariates(
                 target_col=target_col,
                 past_cov_cols=past_cov_cols,
                 future_cov_cols=future_cov_cols,
+                static_cov_cols=static_cov_cols,
+                exogenous=exogenous,
                 epochs=epochs,
                 batch_size=batch_size,
                 verbose=verbose
@@ -197,16 +252,56 @@ def timeseries_cv_with_covariates(
             # 4. Predict
             # pred_input_df needs to be formatted correctly.
             # predict expects a DF with history + future rows.
-            forecast = model.predict(pred_input_df.reset_index())
+            # We pass it with index (timestamp) preserved so we can align results.
+            forecast = model.predict(pred_input_df)
             
+            # Align Forecast and Ground Truth
+            # forecast has index=timestamp, columns=[q10, q50, q90, id_column]
+            # test_df has index=timestamp, columns=[target_col, id_column, ...]
+            
+            # Reset index to merge on timestamp + id_column
+            forecast_reset = forecast.reset_index()
+            if 'timestamp' not in forecast_reset.columns:
+                 forecast_reset = forecast_reset.rename(columns={forecast.index.name or 'index': 'timestamp'})
+
+            test_reset = test_df.reset_index()
+            if 'timestamp' not in test_reset.columns:
+                 test_reset = test_reset.rename(columns={test_df.index.name or 'index': 'timestamp'})
+            
+            # Identify ID column name (from static_cov_cols or assumed)
+            merge_on = ['timestamp']
+            if static_cov_cols:
+                missing_in_forecast = [c for c in static_cov_cols if c not in forecast_reset.columns]
+                missing_in_test = [c for c in static_cov_cols if c not in test_reset.columns]
+                
+                if missing_in_forecast or missing_in_test:
+                    raise ValueError(
+                        f"Static covariates missing! "
+                        f"Forecast: {missing_in_forecast}, Test: {missing_in_test}"
+                    )
+                
+                merge_on.extend(static_cov_cols)
+            
+            merged = pd.merge(test_reset, forecast_reset, on=merge_on, how='inner', suffixes=('', '_pred'))
+            
+            if len(merged) == 0:
+                print(f"Window {window}: Warning - No overlap between forecast and test data after merge.")
+                continue
+            
+            # Verify no data loss (optional but good for debugging)
+            if len(merged) != len(test_reset):
+                # This is expected if forecast only covers a subset (e.g. if some series failed)
+                # But we should warn if it's significant
+                pass
+
             # Extract median prediction (q50)
-            predictions = forecast['q50'].values
+            predictions = merged['q50'].values
             
             # 5. Metrics
-            actuals = test_df[target_col].values
+            actuals = merged[target_col].values
             
-            # Truncate predictions if they exceed actuals (shouldn't happen with correct logic)
-            predictions = predictions[:len(actuals)]
+            # Truncate predictions if they exceed actuals (shouldn't happen with inner merge)
+            # predictions = predictions[:len(actuals)]
             
             # Inverse Transform if scaler provided
             if scaler:
@@ -244,23 +339,29 @@ def timeseries_cv_with_covariates(
             traceback.print_exc()
         
         # Move to next fold
-        if working_df.index.freq:
-             current_date += (working_df.index.freq * stride)
+        # Move to next fold
+        if freq:
+             current_date += (freq * stride)
         else:
+             # Fallback if no freq
+             # We can't easily advance without freq unless we use position, 
+             # but current_date is a Timestamp.
+             # If we are here, it means we inferred freq failed.
+             # We should probably use the unique_timestamps logic again or just add days as fallback
              current_date += pd.Timedelta(days=stride)
              
         gc.collect()
         keras.backend.clear_session() # Optional: clear session to free memory if re-building
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*95}")
     print("CROSS-VALIDATION SUMMARY")
-    print(f"{'='*70}")
+    print(f"{'='*95}")
     print(f"Total Windows: {window}")
     if metrics['rmse']:
         print(f"Overall RMSE: {np.mean(metrics['rmse']):.2f}")
         print(f"Overall MAE:  {np.mean(metrics['mae']):.2f}")
         print(f"Overall MAPE: {np.mean(metrics['mape']):.2f}%")
-    print(f"{'='*70}\n")
+    print(f"{'='*95}\n")
 
     if not results:
         return pd.DataFrame()
