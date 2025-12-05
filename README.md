@@ -385,7 +385,7 @@ Contributions are welcome! Please follow these guidelines:
 If you use this implementation in your research, please cite the original TFT paper:
 
 ```bibtex
-@article{lim2021temporal,
+@article{lim2020temporal,
   title={Temporal fusion transformers for interpretable multi-horizon time series forecasting},
   author={Lim, Bryan and Ar{\i}k, Sercan {\"O} and Loeff, Nicolas and Pfister, Tomas},
   journal={International Journal of Forecasting},
